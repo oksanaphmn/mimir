@@ -752,10 +752,13 @@ func BenchmarkNewLazyBinaryReader_LoadReader(b *testing.B) {
 						baselineMetrics := test.RecordBucketMetrics(b, bktReg, []string{"get", "get_range"})
 
 						b.StartTimer()
-						_, err := lazyReader.loadReader()
+						reader, err := lazyReader.loadReader()
 						require.NoError(b, err)
 
 						b.StopTimer()
+						err = reader.Close()
+						require.NoError(b, err)
+
 						err = lazyReader.Close()
 						require.NoError(b, err)
 
