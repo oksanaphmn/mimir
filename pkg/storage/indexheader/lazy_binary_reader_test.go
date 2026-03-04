@@ -747,16 +747,16 @@ func BenchmarkNewLazyBinaryReader_LoadReader(b *testing.B) {
 					b.ReportAllocs()
 					b.StopTimer()
 					lazyReader, _, bktReg := benchFactory.factory()
+					baselineMetrics := test.RecordBucketMetrics(b, bktReg, []string{"get", "get_range"})
 					b.StartTimer()
 
-					baselineMetrics := test.RecordBucketMetrics(b, bktReg, []string{"get", "get_range"})
-
-					_, err := lazyReader.loadReader()
-					require.NoError(b, err)
+					for i := 0; i < b.N; i++ {
+						_, err := lazyReader.loadReader()
+						require.NoError(b, err)
+					}
 
 					b.StopTimer()
-					err = lazyReader.Close()
-					require.NoError(b, err)
+					require.NoError(b, lazyReader.Close())
 
 					metricsDiff := test.RecordBucketMetricsDiff(b, bktReg, []string{"get", "get_range"}, baselineMetrics)
 					test.ReportBucketMetrics(b, metricsDiff)
