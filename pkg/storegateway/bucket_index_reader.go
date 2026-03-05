@@ -756,21 +756,6 @@ type resolvedPostingRef struct {
 	lbls labels.Labels
 }
 
-// resolvePostingRefsToStableHash builds a mapping from posting ref to labels.StableHash
-// by loading series labels from the block index. This is needed because compacted
-// blocks store posting refs (not StableHash) as SeriesRef in Parquet metadata files.
-func (r *bucketIndexReader) resolvePostingRefsToStableHash(ctx context.Context, refs []storage.SeriesRef, stats *safeQueryStats) (map[uint64]uint64, error) {
-	resolved, err := r.resolvePostingRefsWithLabels(ctx, refs, stats)
-	if err != nil {
-		return nil, err
-	}
-	result := make(map[uint64]uint64, len(resolved))
-	for ref, r := range resolved {
-		result[ref] = r.hash
-	}
-	return result, nil
-}
-
 // resolvePostingRefsLabelsOnly loads series labels from the block index without
 // computing StableHash. Use this when the caller needs labels but not the hash
 // (e.g. the non-filter resource attributes path).

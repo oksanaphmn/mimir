@@ -100,6 +100,7 @@ type BlocksStoreLimits interface {
 	MaxChunksPerQuery(userID string) int
 	StoreGatewayTenantShardSize(userID string) int
 	StoreGatewayTenantShardSizePerZone(userID string) int
+	MaxResourceAttributesCacheSizeBytes(userID string) int
 }
 
 type blocksStoreQueryableMetrics struct {
@@ -324,6 +325,7 @@ func (q *BlocksStoreQueryable) Querier(mint, maxt int64) (storage.Querier, error
 		&blocksResourceFetcher{blocksQueryable: q},
 		mint,
 		maxt,
+		q.limits.MaxResourceAttributesCacheSizeBytes,
 		q.logger,
 	), nil
 }
@@ -1525,9 +1527,14 @@ func (q *BlocksStoreQueryable) ResourceAttributes(ctx context.Context, minT, max
 
 	convertedMatchers := convertMatchersToLabelMatcher(matchers)
 
+	remainingBlocks := knownBlocks
 	for attempt := 1; attempt <= q.dynamicReplication.MaxReplicationFactor(); attempt++ {
+		if len(remainingBlocks) == 0 {
+			break
+		}
+
 		// Find store-gateway instances having the blocks
-		clients, err := q.stores.GetClientsFor(tenantID, knownBlocks, attemptedBlocks)
+		clients, err := q.stores.GetClientsFor(tenantID, remainingBlocks, attemptedBlocks)
 		if err != nil {
 			if attempt > 1 {
 				level.Warn(spanLog).Log("msg", "unable to get store-gateway clients while retrying", "err", err)
@@ -1540,6 +1547,9 @@ func (q *BlocksStoreQueryable) ResourceAttributes(ctx context.Context, minT, max
 
 		reqCtx := grpcContextWithBucketStoreRequestMeta(ctx, tenantID, indexMeta)
 		g, gCtx := errgroup.WithContext(reqCtx)
+
+		queriedBlockSet := map[ulid.ULID]struct{}{}
+		var queriedBlocksMtx sync.Mutex
 
 		for c, blockIDs := range clients {
 			g.Go(func() error {
@@ -1554,11 +1564,13 @@ func (q *BlocksStoreQueryable) ResourceAttributes(ctx context.Context, minT, max
 
 				mtx.Lock()
 				results = append(results, clientResults...)
-				touchedStores[c.RemoteAddress()] = struct{}{}
-				for _, blockID := range queriedBlocks {
-					attemptedBlocks[blockID] = append(attemptedBlocks[blockID], c.RemoteAddress())
-				}
 				mtx.Unlock()
+
+				queriedBlocksMtx.Lock()
+				for _, blockID := range queriedBlocks {
+					queriedBlockSet[blockID] = struct{}{}
+				}
+				queriedBlocksMtx.Unlock()
 
 				return nil
 			})
@@ -1568,15 +1580,32 @@ func (q *BlocksStoreQueryable) ResourceAttributes(ctx context.Context, minT, max
 			return nil, err
 		}
 
-		// Update attemptedBlocks for blocks we tried but didn't get queried
+		// Record all attempted blocks for retry exclusion, matching the Series path.
+		// This uses all requested blockIDs (not just queriedBlockSet from hints)
+		// so that retries correctly exclude stores that were already tried.
 		for client, blockIDs := range clients {
 			touchedStores[client.RemoteAddress()] = struct{}{}
 			for _, blockID := range blockIDs {
-				if _, ok := attemptedBlocks[blockID]; !ok {
-					attemptedBlocks[blockID] = append(attemptedBlocks[blockID], client.RemoteAddress())
-				}
+				attemptedBlocks[blockID] = append(attemptedBlocks[blockID], client.RemoteAddress())
 			}
 		}
+
+		// Narrow remaining blocks to only those not yet successfully queried.
+		var newRemaining bucketindex.Blocks
+		for _, b := range remainingBlocks {
+			if _, ok := queriedBlockSet[b.ID]; !ok {
+				newRemaining = append(newRemaining, b)
+			}
+		}
+		remainingBlocks = newRemaining
+	}
+
+	if len(remainingBlocks) > 0 {
+		remainingIDs := make([]ulid.ULID, 0, len(remainingBlocks))
+		for _, b := range remainingBlocks {
+			remainingIDs = append(remainingIDs, b.ID)
+		}
+		level.Warn(spanLog).Log("msg", "resource attributes query could not fetch all blocks", "remaining_blocks", fmt.Sprintf("%v", remainingIDs))
 	}
 
 	spanLog.DebugLog("msg", "resource attributes query complete", "num_results", len(results), "num_stores", len(touchedStores))
@@ -1621,12 +1650,21 @@ func (q *BlocksStoreQueryable) fetchResourceAttributesFromStore(
 
 		results = append(results, resp.Items...)
 
+		// Break early if the limit is reached to avoid accumulating unbounded results.
+		if limit > 0 && int64(len(results)) >= limit {
+			break
+		}
+
 		// Extract queried blocks from hints if available
 		if resp.Hints != nil {
 			hints := hintspb.ResourceAttributesResponseHints{}
-			if err := types.UnmarshalAny(resp.Hints, &hints); err == nil {
+			if err := types.UnmarshalAny(resp.Hints, &hints); err != nil {
+				level.Warn(spanLog).Log("msg", "failed to unmarshal resource attributes response hints", "err", err)
+			} else {
 				ids, err := convertBlockHintsToULIDsOpaque(hints.QueriedBlocks)
-				if err == nil {
+				if err != nil {
+					level.Warn(spanLog).Log("msg", "failed to convert block hints to ULIDs", "err", err)
+				} else {
 					queriedBlocks = append(queriedBlocks, ids...)
 				}
 			}

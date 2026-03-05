@@ -453,8 +453,9 @@ type BucketStoreConfig struct {
 	// Controls advanced options for index-header file reading.
 	IndexHeader indexheader.Config `yaml:"index_header" category:"advanced"`
 
-	StreamingBatchSize    int     `yaml:"streaming_series_batch_size" category:"advanced"`
-	SeriesFetchPreference float64 `yaml:"series_fetch_preference" category:"advanced"`
+	StreamingBatchSize      int           `yaml:"streaming_series_batch_size" category:"advanced"`
+	SeriesFetchPreference   float64       `yaml:"series_fetch_preference" category:"advanced"`
+	ParquetCacheIdleTimeout time.Duration `yaml:"parquet_cache_idle_timeout" category:"advanced"`
 }
 
 // RegisterFlags registers the BucketStore flags
@@ -482,6 +483,7 @@ func (cfg *BucketStoreConfig) RegisterFlags(f *flag.FlagSet) {
 	f.Uint64Var(&cfg.PartitionerMaxGapBytes, "blocks-storage.bucket-store.partitioner-max-gap-bytes", DefaultPartitionerMaxGapSize, "Max size - in bytes - of a gap for which the partitioner aggregates together two bucket GET object requests.")
 	f.IntVar(&cfg.StreamingBatchSize, "blocks-storage.bucket-store.batch-series-size", 5000, "This option controls how many series to fetch per batch. The batch size must be greater than 0.")
 	f.Float64Var(&cfg.SeriesFetchPreference, "blocks-storage.bucket-store.series-fetch-preference", 0.75, "This parameter controls the trade-off in fetching series versus fetching postings to fulfill a series request. Increasing the series preference results in fetching more series and reducing the volume of postings fetched. Reducing the series preference results in the opposite. Increase this parameter to reduce the rate of fetched series bytes (see \"Mimir / Queries\" dashboard) or API calls to the object store. Must be a positive floating point number.")
+	f.DurationVar(&cfg.ParquetCacheIdleTimeout, "blocks-storage.bucket-store.parquet-cache-idle-timeout", 30*time.Minute, "How long cached Parquet series-metadata data is kept in memory after last access. 0 to disable eviction.")
 }
 
 // Validate the config.

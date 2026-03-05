@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/grafana/dskit/tenant"
@@ -63,8 +64,11 @@ type ResourceAttributesBlocksQueryable interface {
 
 // ResourceAttributesHandlerConfig holds configuration for resource attributes handler.
 type ResourceAttributesHandlerConfig struct {
-	QueryStoreAfter      time.Duration
-	QueryIngestersWithin func(userID string) time.Duration
+	QueryStoreAfter                 time.Duration
+	QueryIngestersWithin            func(userID string) time.Duration
+	MaxQueryLookback                func(userID string) time.Duration
+	MaxLabelsQueryLength            func(userID string) time.Duration
+	MaxResourceAttributesQueryLimit func(userID string) int
 }
 
 // NewResourceAttributesHandler creates a http.Handler for the /api/v1/resources endpoint.
@@ -84,45 +88,34 @@ func NewResourceAttributesHandler(d Distributor, blocksQueryable ResourceAttribu
 
 		// Parse request parameters
 		if err := r.ParseForm(); err != nil {
-			util.WriteJSONResponse(w, ResourceAttributesResponse{
-				Status: statusError,
-				Error:  "error parsing request form: " + err.Error(),
-			})
+			http.Error(w, "error parsing request form: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 
 		// Parse time range
 		startMs, endMs, err := parseResourceTimeRange(r)
 		if err != nil {
-			util.WriteJSONResponse(w, ResourceAttributesResponse{
-				Status: statusError,
-				Error:  err.Error(),
-			})
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		// Parse matchers
+		// Parse matchers — multiple match[] params have OR (union) semantics,
+		// matching the Prometheus /api/v1/series convention.
 		matcherSets := r.Form["match[]"]
 		if len(matcherSets) == 0 {
-			util.WriteJSONResponse(w, ResourceAttributesResponse{
-				Status: statusError,
-				Error:  "at least one matcher is required (use {__name__=~\".+\"} for all series)",
-			})
+			http.Error(w, "at least one matcher is required (use {__name__=~\".+\"} for all series)", http.StatusBadRequest)
 			return
 		}
 
 		pqlParser := promqlext.NewPromQLParser()
-		var allMatchers []*labels.Matcher
+		var parsedMatcherSets [][]*labels.Matcher
 		for _, matcherSet := range matcherSets {
 			matchers, err := pqlParser.ParseMetricSelector(matcherSet)
 			if err != nil {
-				util.WriteJSONResponse(w, ResourceAttributesResponse{
-					Status: statusError,
-					Error:  "error parsing matcher: " + err.Error(),
-				})
+				http.Error(w, "error parsing matcher: "+err.Error(), http.StatusBadRequest)
 				return
 			}
-			allMatchers = append(allMatchers, matchers...)
+			parsedMatcherSets = append(parsedMatcherSets, matchers)
 		}
 
 		// Parse limit (optional)
@@ -130,11 +123,17 @@ func NewResourceAttributesHandler(d Distributor, blocksQueryable ResourceAttribu
 		if limitStr := r.FormValue("limit"); limitStr != "" {
 			limit, err = strconv.ParseInt(limitStr, 10, 64)
 			if err != nil {
-				util.WriteJSONResponse(w, ResourceAttributesResponse{
-					Status: statusError,
-					Error:  "invalid limit parameter: " + err.Error(),
-				})
+				http.Error(w, "invalid limit parameter: "+err.Error(), http.StatusBadRequest)
 				return
+			}
+		}
+
+		// Clamp limit to the configured per-tenant max.
+		if cfg.MaxResourceAttributesQueryLimit != nil {
+			if maxLimit := int64(cfg.MaxResourceAttributesQueryLimit(tenantID)); maxLimit > 0 {
+				if limit <= 0 || limit > maxLimit {
+					limit = maxLimit
+				}
 			}
 		}
 
@@ -147,46 +146,83 @@ func NewResourceAttributesHandler(d Distributor, blocksQueryable ResourceAttribu
 			endMs = nowMs
 		}
 
-		// Query both ingesters and store-gateways in parallel
-		g, gCtx := errgroup.WithContext(ctx)
+		// Default startMs to 24h ago if not specified, to prevent epoch-to-now scans.
+		if startMs == 0 {
+			startMs = nowMs - (24 * time.Hour).Milliseconds()
+		}
 
-		// Query ingesters via distributor
-		var ingesterResults []*ingester_client.SeriesResourceAttributes
+		// Apply max query lookback to avoid scanning all blocks since epoch.
+		if cfg.MaxQueryLookback != nil {
+			if maxLookback := cfg.MaxQueryLookback(tenantID); maxLookback > 0 {
+				earliest := nowMs - maxLookback.Milliseconds()
+				if startMs < earliest {
+					startMs = earliest
+				}
+			}
+		}
+
+		// Clamp time range to MaxLabelsQueryLength if configured.
+		if cfg.MaxLabelsQueryLength != nil {
+			if maxLen := cfg.MaxLabelsQueryLength(tenantID); maxLen > 0 {
+				if endMs-startMs > maxLen.Milliseconds() {
+					startMs = endMs - maxLen.Milliseconds()
+				}
+			}
+		}
+
+		// Query ingesters and store-gateways in parallel, issuing separate queries
+		// per matcher set (OR semantics) and merging results. Cap concurrency to
+		// avoid excessive fan-out when many match[] params are provided.
+		const maxResourceAttrConcurrency = 10
+		g, gCtx := errgroup.WithContext(ctx)
+		g.SetLimit(maxResourceAttrConcurrency)
+
 		var queryIngestersWithin time.Duration
 		if cfg.QueryIngestersWithin != nil {
 			queryIngestersWithin = cfg.QueryIngestersWithin(tenantID)
 		}
 		shouldQueryIngesters := ShouldQueryIngesters(queryIngestersWithin, now, endMs)
-		if shouldQueryIngesters {
-			g.Go(func() error {
-				var err error
-				ingesterResults, err = d.ResourceAttributes(gCtx, startMs, endMs, allMatchers, limit, nil)
-				return err
-			})
+		shouldQueryStore := blocksQueryable != nil && ShouldQueryBlockStore(cfg.QueryStoreAfter, now, startMs)
+
+		var resultsMu sync.Mutex
+		var ingesterConverted, storeConverted []*SeriesResourceAttributesData
+
+		for _, matchers := range parsedMatcherSets {
+			matchers := matchers // capture loop var
+			if shouldQueryIngesters {
+				g.Go(func() error {
+					results, err := d.ResourceAttributes(gCtx, startMs, endMs, matchers, limit, nil)
+					if err != nil {
+						return err
+					}
+					converted := convertIngesterResults(results)
+					resultsMu.Lock()
+					ingesterConverted = append(ingesterConverted, converted...)
+					resultsMu.Unlock()
+					return nil
+				})
+			}
+
+			if shouldQueryStore {
+				g.Go(func() error {
+					results, err := blocksQueryable.ResourceAttributes(gCtx, startMs, endMs, matchers, limit, nil)
+					if err != nil {
+						return err
+					}
+					converted := convertStoreResults(results)
+					resultsMu.Lock()
+					storeConverted = append(storeConverted, converted...)
+					resultsMu.Unlock()
+					return nil
+				})
+			}
 		}
 
-		// Query store-gateways via blocks queryable
-		var storeResults []*storepb.ResourceAttributesSeriesData
-		if blocksQueryable != nil && ShouldQueryBlockStore(cfg.QueryStoreAfter, now, startMs) {
-			g.Go(func() error {
-				var err error
-				storeResults, err = blocksQueryable.ResourceAttributes(gCtx, startMs, endMs, allMatchers, limit, nil)
-				return err
-			})
-		}
-
-		// Wait for both queries to complete
+		// Wait for all queries to complete
 		if err := g.Wait(); err != nil {
-			util.WriteJSONResponse(w, ResourceAttributesResponse{
-				Status: statusError,
-				Error:  "error querying resource attributes: " + err.Error(),
-			})
+			http.Error(w, "error querying resource attributes: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-
-		// Convert and merge results from both sources
-		ingesterConverted := convertIngesterResults(ingesterResults)
-		storeConverted := convertStoreResults(storeResults)
 
 		// Merge results, deduplicating by series labels
 		allSeries = mergeResourceAttributesSeries(ingesterConverted, storeConverted)
@@ -323,34 +359,46 @@ func mergeResourceAttributesSeries(ingesterSeries, storeSeries []*SeriesResource
 	// Create a map for efficient lookup by label fingerprint
 	seriesMap := make(map[string]*SeriesResourceAttributesData)
 
-	// Add all ingester series to the map
+	// Add all ingester series, merging duplicates that arise from
+	// multiple matcher sets (OR semantics) matching the same series.
 	for _, s := range ingesterSeries {
 		key := labelsMapToKey(s.Labels)
-		seriesMap[key] = s
-	}
-
-	// Merge store series with existing ingester series
-	for _, s := range storeSeries {
-		key := labelsMapToKey(s.Labels)
 		if existing, ok := seriesMap[key]; ok {
-			// Merge versions from both sources
 			existing.Versions = mergeResourceVersions(existing.Versions, s.Versions)
 		} else {
 			seriesMap[key] = s
 		}
 	}
 
-	// Convert map back to slice
-	result := make([]*SeriesResourceAttributesData, 0, len(seriesMap))
-	for _, s := range seriesMap {
-		result = append(result, s)
+	// Merge store series with existing ingester series
+	for _, s := range storeSeries {
+		key := labelsMapToKey(s.Labels)
+		if existing, ok := seriesMap[key]; ok {
+			existing.Versions = mergeResourceVersions(existing.Versions, s.Versions)
+		} else {
+			seriesMap[key] = s
+		}
 	}
 
-	// Sort by labels for consistent ordering
-	sort.Slice(result, func(i, j int) bool {
-		return labelsMapToKey(result[i].Labels) < labelsMapToKey(result[j].Labels)
+	// Convert map back to slice, pre-computing sort keys to avoid
+	// recomputing labelsMapToKey O(N log N) times during sort.
+	type keyed struct {
+		key  string
+		data *SeriesResourceAttributesData
+	}
+	keyedResult := make([]keyed, 0, len(seriesMap))
+	for key, s := range seriesMap {
+		keyedResult = append(keyedResult, keyed{key: key, data: s})
+	}
+
+	sort.Slice(keyedResult, func(i, j int) bool {
+		return keyedResult[i].key < keyedResult[j].key
 	})
 
+	result := make([]*SeriesResourceAttributesData, len(keyedResult))
+	for i, k := range keyedResult {
+		result[i] = k.data
+	}
 	return result
 }
 
@@ -368,36 +416,50 @@ func labelsMapToKey(lbls map[string]string) string {
 		buf.WriteString(k)
 		buf.WriteByte(0)
 		buf.WriteString(lbls[k])
-		buf.WriteByte(0)
+		buf.WriteByte(1)
 	}
 	return buf.String()
 }
 
 // mergeResourceVersions merges and deduplicates resource versions from two sources.
+// Deduplication uses time range AND identifying attributes to avoid incorrectly
+// collapsing versions that share the same time range but differ in content.
 func mergeResourceVersions(a, b []*ResourceVersionData) []*ResourceVersionData {
-	// Simple merge: append and sort by time
-	// In the future, we could deduplicate overlapping time ranges
-	all := append(a, b...)
-
-	// Sort by MinTimeMs
-	sort.Slice(all, func(i, j int) bool {
-		return all[i].MinTimeMs < all[j].MinTimeMs
-	})
-
-	// Deduplicate versions with same time range
-	if len(all) == 0 {
-		return all
+	if len(a) == 0 {
+		return b
+	}
+	if len(b) == 0 {
+		return a
 	}
 
-	result := []*ResourceVersionData{all[0]}
-	for i := 1; i < len(all); i++ {
-		last := result[len(result)-1]
-		// Skip if same time range (keep the first one, which is from ingesters)
-		if all[i].MinTimeMs == last.MinTimeMs && all[i].MaxTimeMs == last.MaxTimeMs {
-			continue
+	type versionKey struct {
+		minTime     int64
+		maxTime     int64
+		identifying string
+	}
+
+	seen := make(map[versionKey]bool, len(a)+len(b))
+	result := make([]*ResourceVersionData, 0, len(a)+len(b))
+
+	for _, v := range a {
+		key := versionKey{v.MinTimeMs, v.MaxTimeMs, labelsMapToKey(v.Identifying)}
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, v)
 		}
-		result = append(result, all[i])
 	}
+
+	for _, v := range b {
+		key := versionKey{v.MinTimeMs, v.MaxTimeMs, labelsMapToKey(v.Identifying)}
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, v)
+		}
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].MinTimeMs < result[j].MinTimeMs
+	})
 
 	return result
 }
@@ -416,39 +478,27 @@ func NewResourceAttributesSeriesHandler(d Distributor, blocksQueryable ResourceA
 		}
 
 		if err := r.ParseForm(); err != nil {
-			util.WriteJSONResponse(w, ResourceAttributesResponse{
-				Status: statusError,
-				Error:  "error parsing request form: " + err.Error(),
-			})
+			http.Error(w, "error parsing request form: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 
 		// Parse time range
 		startMs, endMs, err := parseResourceTimeRange(r)
 		if err != nil {
-			util.WriteJSONResponse(w, ResourceAttributesResponse{
-				Status: statusError,
-				Error:  err.Error(),
-			})
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
 		// Parse resource attribute filters: resource.attr=key:value
 		filterParams := r.Form["resource.attr"]
 		if len(filterParams) == 0 {
-			util.WriteJSONResponse(w, ResourceAttributesResponse{
-				Status: statusError,
-				Error:  "at least one resource.attr parameter is required (format: resource.attr=key:value)",
-			})
+			http.Error(w, "at least one resource.attr parameter is required (format: resource.attr=key:value)", http.StatusBadRequest)
 			return
 		}
 
 		ingesterFilters, storeFilters, err := parseResourceAttrFilters(filterParams)
 		if err != nil {
-			util.WriteJSONResponse(w, ResourceAttributesResponse{
-				Status: statusError,
-				Error:  err.Error(),
-			})
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
@@ -457,11 +507,17 @@ func NewResourceAttributesSeriesHandler(d Distributor, blocksQueryable ResourceA
 		if limitStr := r.FormValue("limit"); limitStr != "" {
 			limit, err = strconv.ParseInt(limitStr, 10, 64)
 			if err != nil {
-				util.WriteJSONResponse(w, ResourceAttributesResponse{
-					Status: statusError,
-					Error:  "invalid limit parameter: " + err.Error(),
-				})
+				http.Error(w, "invalid limit parameter: "+err.Error(), http.StatusBadRequest)
 				return
+			}
+		}
+
+		// Clamp limit to the configured per-tenant max.
+		if cfg.MaxResourceAttributesQueryLimit != nil {
+			if maxLimit := int64(cfg.MaxResourceAttributesQueryLimit(tenantID)); maxLimit > 0 {
+				if limit <= 0 || limit > maxLimit {
+					limit = maxLimit
+				}
 			}
 		}
 
@@ -473,9 +529,34 @@ func NewResourceAttributesSeriesHandler(d Distributor, blocksQueryable ResourceA
 			endMs = nowMs
 		}
 
+		// Default startMs to 24h ago if not specified, to prevent epoch-to-now scans.
+		if startMs == 0 {
+			startMs = nowMs - (24 * time.Hour).Milliseconds()
+		}
+
+		// Apply max query lookback to avoid scanning all blocks since epoch.
+		if cfg.MaxQueryLookback != nil {
+			if maxLookback := cfg.MaxQueryLookback(tenantID); maxLookback > 0 {
+				earliest := nowMs - maxLookback.Milliseconds()
+				if startMs < earliest {
+					startMs = earliest
+				}
+			}
+		}
+
+		// Clamp time range to MaxLabelsQueryLength if configured.
+		if cfg.MaxLabelsQueryLength != nil {
+			if maxLen := cfg.MaxLabelsQueryLength(tenantID); maxLen > 0 {
+				if endMs-startMs > maxLen.Milliseconds() {
+					startMs = endMs - maxLen.Milliseconds()
+				}
+			}
+		}
+
 		g, gCtx := errgroup.WithContext(ctx)
 
-		// Query ingesters via distributor with filters (no matchers needed)
+		// Query ingesters via distributor with filters (no matchers needed).
+		// Pass limit=0 to individual sources; limit is applied post-merge.
 		var ingesterResults []*ingester_client.SeriesResourceAttributes
 		var queryIngestersWithin time.Duration
 		if cfg.QueryIngestersWithin != nil {
@@ -501,10 +582,7 @@ func NewResourceAttributesSeriesHandler(d Distributor, blocksQueryable ResourceA
 		}
 
 		if err := g.Wait(); err != nil {
-			util.WriteJSONResponse(w, ResourceAttributesResponse{
-				Status: statusError,
-				Error:  "error querying resource attributes: " + err.Error(),
-			})
+			http.Error(w, "error querying resource attributes: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 

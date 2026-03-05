@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -140,27 +141,26 @@ func (b *TSDBBuilder) PushToStorageAndReleaseRequest(ctx context.Context, req *m
 
 		ingestCreatedTimestamp := ts.CreatedTimestamp > 0
 
+		metricName := nonCopiedLabels.Get(model.MetricNameLabel)
+
 		// Build resource context once per time series.
 		var resourceCtx *storage.ResourceContext
-		if ts.ResourceAttributes != nil && len(ts.ResourceAttributes.Identifying) > 0 {
-			metricName := nonCopiedLabels.Get(model.MetricNameLabel)
-			if metricName != "target_info" {
-				resourceCtx = &storage.ResourceContext{
-					Identifying: entriesToMap(ts.ResourceAttributes.Identifying),
-					Descriptive: entriesToMap(ts.ResourceAttributes.Descriptive),
-					Entities:    convertResourceEntities(ts.ResourceAttributes.Entities),
-				}
+		if ts.ResourceAttributes != nil && len(ts.ResourceAttributes.Identifying) > 0 && metricName != "target_info" {
+			resourceCtx = &storage.ResourceContext{
+				Identifying: entriesToMap(ts.ResourceAttributes.Identifying),
+				Descriptive: entriesToMap(ts.ResourceAttributes.Descriptive),
+				Entities:    convertResourceEntities(ts.ResourceAttributes.Entities),
 			}
 		}
 
 		// Build scope context once per time series.
 		var scopeCtx *storage.ScopeContext
-		if ts.ScopeAttributes != nil {
+		if ts.ScopeAttributes != nil && metricName != "target_info" {
 			if ts.ScopeAttributes.Name != "" || ts.ScopeAttributes.Version != "" || ts.ScopeAttributes.SchemaURL != "" || len(ts.ScopeAttributes.Attrs) > 0 {
 				scopeCtx = &storage.ScopeContext{
-					Name:      ts.ScopeAttributes.Name,
-					Version:   ts.ScopeAttributes.Version,
-					SchemaURL: ts.ScopeAttributes.SchemaURL,
+					Name:      strings.Clone(ts.ScopeAttributes.Name),
+					Version:   strings.Clone(ts.ScopeAttributes.Version),
+					SchemaURL: strings.Clone(ts.ScopeAttributes.SchemaURL),
 					Attrs:     entriesToMap(ts.ScopeAttributes.Attrs),
 				}
 			}
@@ -623,13 +623,17 @@ func (b *TSDBBuilder) buildSparseIndexHeader(ctx context.Context, dbDir string, 
 	return br.Close()
 }
 
+// entriesToMap converts attribute entries to a map, cloning all strings to
+// ensure safety. The input entries may contain UnsafeMutableStrings backed
+// by a gRPC buffer that is returned to the pool after the request is
+// processed (see CLAUDE.md "Unsafe memory tricks").
 func entriesToMap(entries []mimirpb.AttributeEntry) map[string]string {
 	if len(entries) == 0 {
 		return nil
 	}
 	m := make(map[string]string, len(entries))
 	for _, e := range entries {
-		m[e.Key] = e.Value
+		m[strings.Clone(e.Key)] = strings.Clone(e.Value)
 	}
 	return m
 }
@@ -641,7 +645,7 @@ func convertResourceEntities(entities []mimirpb.ResourceEntity) []storage.Entity
 	result := make([]storage.EntityData, len(entities))
 	for i, e := range entities {
 		result[i] = storage.EntityData{
-			Type:        e.Type,
+			Type:        strings.Clone(e.Type),
 			ID:          entriesToMap(e.ID),
 			Description: entriesToMap(e.Description),
 		}

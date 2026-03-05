@@ -3291,9 +3291,12 @@ func (d *Distributor) ResourceAttributes(ctx context.Context, startMs, endMs int
 }
 
 // resourceAttributesResponse is a helper to merge/deduplicate ResourceAttributes responses from ingesters.
+// It uses a hash map with collision handling (matching the pattern in MimirAppender.processLabelsAndMetadata)
+// to correctly handle the rare but possible case of two distinct label sets hashing to the same uint64.
 type resourceAttributesResponse struct {
-	m      sync.Mutex
-	series map[uint64]*ingester_client.SeriesResourceAttributes
+	m          sync.Mutex
+	series     map[uint64]*ingester_client.SeriesResourceAttributes
+	collisions map[uint64][]*ingester_client.SeriesResourceAttributes
 }
 
 func newResourceAttributesResponse() *resourceAttributesResponse {
@@ -3310,45 +3313,112 @@ func (r *resourceAttributesResponse) add(items []*ingester_client.SeriesResource
 		lbls := mimirpb.FromLabelAdaptersToLabels(item.Labels)
 		lblHash := labels.StableHash(lbls)
 
-		if existing, ok := r.series[lblHash]; !ok {
-			// First time seeing this series, store it with a deep copy of labels
-			itemCopy := &ingester_client.SeriesResourceAttributes{
+		existing, ok := r.series[lblHash]
+		if !ok {
+			// First time seeing this hash, store it with a deep copy of labels
+			// and a cloned Versions slice. The original slice may be backed by
+			// gRPC receive buffer memory that is released after the stream closes.
+			r.series[lblHash] = &ingester_client.SeriesResourceAttributes{
 				Labels:   mimirpb.FromLabelsToLabelAdapters(lbls.Copy()),
-				Versions: item.Versions,
+				Versions: slices.Clone(item.Versions),
 			}
-			r.series[lblHash] = itemCopy
-		} else {
-			// Series already exists, merge resource versions
+			continue
+		}
+
+		// Hash exists — check if the labels actually match.
+		if labels.Equal(lbls, mimirpb.FromLabelAdaptersToLabels(existing.Labels)) {
 			r.mergeVersions(existing, item)
+			continue
+		}
+
+		// Hash collision — check the collision list.
+		if r.collisions != nil {
+			found := false
+			for _, col := range r.collisions[lblHash] {
+				if labels.Equal(lbls, mimirpb.FromLabelAdaptersToLabels(col.Labels)) {
+					r.mergeVersions(col, item)
+					found = true
+					break
+				}
+			}
+			if found {
+				continue
+			}
+		}
+
+		// New series with a colliding hash.
+		if r.collisions == nil {
+			r.collisions = make(map[uint64][]*ingester_client.SeriesResourceAttributes)
+		}
+		r.collisions[lblHash] = append(r.collisions[lblHash], &ingester_client.SeriesResourceAttributes{
+			Labels:   mimirpb.FromLabelsToLabelAdapters(lbls.Copy()),
+			Versions: slices.Clone(item.Versions),
+		})
+	}
+}
+
+// versionDedupKey deduplicates versions in mergeVersions. Using a struct key
+// with a pre-serialized identifying-attrs string gives O(E+N) dedup.
+type versionDedupKey struct {
+	minTime     int64
+	maxTime     int64
+	identifying string
+}
+
+// mergeVersions merges resource attribute versions from a new item into the existing one.
+// It deduplicates versions by time range AND identifying attributes, so that two versions
+// from different replicas covering the same time range but with different attribute content
+// are not incorrectly collapsed.
+func (r *resourceAttributesResponse) mergeVersions(existing, newItem *ingester_client.SeriesResourceAttributes) {
+	// Build set from existing versions.
+	seen := make(map[versionDedupKey]struct{}, len(existing.Versions))
+	for _, v := range existing.Versions {
+		seen[versionDedupKey{v.MinTimeMs, v.MaxTimeMs, identifyingAttrsKey(v.Identifying)}] = struct{}{}
+	}
+	for _, newVer := range newItem.Versions {
+		key := versionDedupKey{newVer.MinTimeMs, newVer.MaxTimeMs, identifyingAttrsKey(newVer.Identifying)}
+		if _, ok := seen[key]; !ok {
+			seen[key] = struct{}{}
+			existing.Versions = append(existing.Versions, newVer)
 		}
 	}
 }
 
-// mergeVersions merges resource attribute versions from a new item into the existing one.
-// It deduplicates versions by their time range overlap.
-func (r *resourceAttributesResponse) mergeVersions(existing, newItem *ingester_client.SeriesResourceAttributes) {
-	for _, newVer := range newItem.Versions {
-		found := false
-		for _, existingVer := range existing.Versions {
-			// Consider versions as duplicates if they have the same time range
-			if existingVer.MinTimeMs == newVer.MinTimeMs && existingVer.MaxTimeMs == newVer.MaxTimeMs {
-				found = true
-				break
-			}
-		}
-		if !found {
-			existing.Versions = append(existing.Versions, newVer)
-		}
+// identifyingAttrsKey builds a deterministic string from identifying attributes
+// for use as a map key. Keys are sorted for consistent output.
+func identifyingAttrsKey(m map[string]string) string {
+	if len(m) == 0 {
+		return ""
 	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k)
+		b.WriteByte(0)
+		b.WriteString(m[k])
+		b.WriteByte(1)
+	}
+	return b.String()
 }
 
 func (r *resourceAttributesResponse) result() []*ingester_client.SeriesResourceAttributes {
 	r.m.Lock()
 	defer r.m.Unlock()
 
-	result := make([]*ingester_client.SeriesResourceAttributes, 0, len(r.series))
+	n := len(r.series)
+	for _, items := range r.collisions {
+		n += len(items)
+	}
+	result := make([]*ingester_client.SeriesResourceAttributes, 0, n)
 	for _, item := range r.series {
 		result = append(result, item)
+	}
+	for _, items := range r.collisions {
+		result = append(result, items...)
 	}
 	return result
 }

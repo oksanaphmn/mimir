@@ -54,6 +54,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/providers/filesystem"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 
 	"github.com/grafana/mimir/pkg/mimirpb"
@@ -3254,4 +3255,228 @@ func TestMergeResourceVersions(t *testing.T) {
 			assert.Len(t, result, tc.expected)
 		})
 	}
+}
+
+func TestResourceAttributesResponseHints_AddQueriedBlock(t *testing.T) {
+	// Verify that ResourceAttributesResponseHints correctly tracks queried block ULIDs
+	// and can be marshaled/unmarshaled via types.Any (the transport format).
+	hints := &hintspb.ResourceAttributesResponseHints{}
+
+	id1 := ulid.MustNew(1, nil)
+	id2 := ulid.MustNew(2, nil)
+
+	hints.AddQueriedBlock(id1)
+	hints.AddQueriedBlock(id2)
+
+	require.Len(t, hints.QueriedBlocks, 2)
+	assert.Equal(t, id1.String(), hints.QueriedBlocks[0].Id)
+	assert.Equal(t, id2.String(), hints.QueriedBlocks[1].Id)
+
+	// Verify roundtrip through types.Any (used by gRPC transport).
+	anyHints, err := types.MarshalAny(hints)
+	require.NoError(t, err)
+
+	decoded := &hintspb.ResourceAttributesResponseHints{}
+	require.NoError(t, types.UnmarshalAny(anyHints, decoded))
+	require.Len(t, decoded.QueriedBlocks, 2)
+	assert.Equal(t, id1.String(), decoded.QueriedBlocks[0].Id)
+	assert.Equal(t, id2.String(), decoded.QueriedBlocks[1].Id)
+}
+
+func TestSendResourceAttributesBatched(t *testing.T) {
+	makeItem := func(size int) *storepb.ResourceAttributesSeriesData {
+		// Create an item with approximately the given size.
+		value := strings.Repeat("x", size)
+		return &storepb.ResourceAttributesSeriesData{
+			Labels: map[string]string{"key": value},
+		}
+	}
+
+	t.Run("empty items", func(t *testing.T) {
+		srv := &resourceAttributesServerMock{ctx: context.Background()}
+		err := sendResourceAttributesBatched(srv, nil, 1024)
+		require.NoError(t, err)
+		assert.Empty(t, srv.responses)
+	})
+
+	t.Run("single batch", func(t *testing.T) {
+		srv := &resourceAttributesServerMock{ctx: context.Background()}
+		items := []*storepb.ResourceAttributesSeriesData{makeItem(10), makeItem(10)}
+		err := sendResourceAttributesBatched(srv, items, 1024)
+		require.NoError(t, err)
+		assert.Len(t, srv.responses, 1)
+		assert.Len(t, srv.responses[0].Items, 2)
+	})
+
+	t.Run("multiple batches", func(t *testing.T) {
+		srv := &resourceAttributesServerMock{ctx: context.Background()}
+		items := []*storepb.ResourceAttributesSeriesData{makeItem(500), makeItem(500), makeItem(500)}
+		err := sendResourceAttributesBatched(srv, items, 600)
+		require.NoError(t, err)
+		// Each item is ~500 bytes; batch limit is 600. So each batch fits 1 item.
+		assert.Len(t, srv.responses, 3)
+		for _, resp := range srv.responses {
+			assert.Len(t, resp.Items, 1)
+		}
+	})
+
+	t.Run("single item exceeds batch size", func(t *testing.T) {
+		srv := &resourceAttributesServerMock{ctx: context.Background()}
+		items := []*storepb.ResourceAttributesSeriesData{makeItem(2000)}
+		err := sendResourceAttributesBatched(srv, items, 100)
+		require.NoError(t, err)
+		// Item is larger than batch size but should still be sent (no infinite loop).
+		assert.Len(t, srv.responses, 1)
+		assert.Len(t, srv.responses[0].Items, 1)
+	})
+
+	t.Run("send error propagated", func(t *testing.T) {
+		srv := &errResourceAttributesServerMock{
+			ctx:      context.Background(),
+			errAfter: 1,
+		}
+		items := []*storepb.ResourceAttributesSeriesData{makeItem(500), makeItem(500), makeItem(500)}
+		err := sendResourceAttributesBatched(srv, items, 600)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "send error")
+	})
+}
+
+// errResourceAttributesServerMock is a server mock that returns an error after N sends.
+type errResourceAttributesServerMock struct {
+	grpc.ServerStream
+	ctx      context.Context
+	sendCt   int
+	errAfter int
+}
+
+func (m *errResourceAttributesServerMock) Send(_ *storepb.ResourceAttributesResponse) error {
+	m.sendCt++
+	if m.sendCt > m.errAfter {
+		return fmt.Errorf("send error")
+	}
+	return nil
+}
+
+func (m *errResourceAttributesServerMock) Context() context.Context {
+	return m.ctx
+}
+
+func TestResourceAttributesRequestHints_BlockMatchers(t *testing.T) {
+	// Verify that request hints with block matchers can be marshaled/unmarshaled
+	// and that the block matchers are correctly parsed.
+	id1 := ulid.MustNew(1, nil)
+	id2 := ulid.MustNew(2, nil)
+
+	reqHints := &hintspb.ResourceAttributesRequestHints{
+		BlockMatchers: []storepb.LabelMatcher{
+			{
+				Type:  storepb.LabelMatcher_RE,
+				Name:  "__block_id",
+				Value: id1.String() + "|" + id2.String(),
+			},
+		},
+	}
+
+	anyHints, err := types.MarshalAny(reqHints)
+	require.NoError(t, err)
+
+	// Unmarshal and verify block matchers can be parsed to Prometheus matchers.
+	decoded := &hintspb.ResourceAttributesRequestHints{}
+	require.NoError(t, types.UnmarshalAny(anyHints, decoded))
+
+	matchers, err := storepb.MatchersToPromMatchers(decoded.BlockMatchers...)
+	require.NoError(t, err)
+	require.Len(t, matchers, 1)
+
+	// Verify the matcher accepts the block IDs.
+	assert.True(t, matchers[0].Matches(id1.String()))
+	assert.True(t, matchers[0].Matches(id2.String()))
+	assert.False(t, matchers[0].Matches("00000000000000000000000000"))
+}
+
+func TestEvictParquetIfIdleSince(t *testing.T) {
+	t.Run("evicts stale reader", func(t *testing.T) {
+		b := &bucketBlock{}
+		b.parquetReader = &prefetchedReaderAt{}
+		b.parquetSize = 1024
+		// Last access was 10 minutes ago.
+		b.parquetUsedAt.Store(time.Now().Add(-10 * time.Minute).UnixNano())
+
+		// Threshold is 5 minutes ago — reader is stale.
+		threshold := time.Now().Add(-5 * time.Minute).UnixNano()
+		evicted := b.evictParquetIfIdleSince(threshold)
+
+		assert.True(t, evicted)
+		assert.Nil(t, b.parquetReader)
+		assert.Equal(t, int64(0), b.parquetSize)
+	})
+
+	t.Run("preserves fresh reader", func(t *testing.T) {
+		reader := &prefetchedReaderAt{}
+		b := &bucketBlock{}
+		b.parquetReader = reader
+		b.parquetSize = 1024
+		// Last access was 1 minute ago.
+		b.parquetUsedAt.Store(time.Now().Add(-1 * time.Minute).UnixNano())
+
+		// Threshold is 5 minutes ago — reader is still fresh.
+		threshold := time.Now().Add(-5 * time.Minute).UnixNano()
+		evicted := b.evictParquetIfIdleSince(threshold)
+
+		assert.False(t, evicted)
+		assert.Same(t, reader, b.parquetReader)
+		assert.Equal(t, int64(1024), b.parquetSize)
+	})
+
+	t.Run("preserves parquetNoFile", func(t *testing.T) {
+		b := &bucketBlock{}
+		b.parquetNoFile = true
+		// No reader set.
+
+		threshold := time.Now().UnixNano()
+		evicted := b.evictParquetIfIdleSince(threshold)
+
+		assert.False(t, evicted)
+		assert.True(t, b.parquetNoFile, "parquetNoFile should not be cleared")
+	})
+
+	t.Run("no reader returns false", func(t *testing.T) {
+		b := &bucketBlock{}
+		threshold := time.Now().UnixNano()
+		evicted := b.evictParquetIfIdleSince(threshold)
+		assert.False(t, evicted)
+	})
+}
+
+func TestEvictIdleParquetCaches(t *testing.T) {
+	s := &BucketStore{
+		blockSet:                newBucketBlockSet(),
+		parquetCacheIdleTimeout: 5 * time.Minute,
+	}
+
+	// Add two blocks: one stale, one fresh.
+	staleBlock := &bucketBlock{meta: &block.Meta{BlockMeta: tsdb.BlockMeta{ULID: ulid.MustNew(1, nil)}}}
+	staleBlock.parquetReader = &prefetchedReaderAt{}
+	staleBlock.parquetSize = 100
+	staleBlock.parquetUsedAt.Store(time.Now().Add(-10 * time.Minute).UnixNano())
+
+	freshBlock := &bucketBlock{meta: &block.Meta{BlockMeta: tsdb.BlockMeta{ULID: ulid.MustNew(2, nil)}}}
+	freshBlock.parquetReader = &prefetchedReaderAt{}
+	freshBlock.parquetSize = 200
+	freshBlock.parquetUsedAt.Store(time.Now().Add(-1 * time.Minute).UnixNano())
+
+	require.NoError(t, s.blockSet.add(staleBlock))
+	require.NoError(t, s.blockSet.add(freshBlock))
+
+	err := s.evictIdleParquetCaches(context.Background())
+	require.NoError(t, err)
+
+	// Stale block should be evicted.
+	assert.Nil(t, staleBlock.parquetReader)
+	assert.Equal(t, int64(0), staleBlock.parquetSize)
+
+	// Fresh block should still be cached.
+	assert.NotNil(t, freshBlock.parquetReader)
+	assert.Equal(t, int64(200), freshBlock.parquetSize)
 }

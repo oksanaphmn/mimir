@@ -999,6 +999,10 @@ func (i *Ingester) updateIndexedResourceAttrs() {
 // sliceEqualsSet reports whether the slice and set contain the same unique elements.
 // The slice may contain duplicates.
 func sliceEqualsSet(slice []string, set map[string]struct{}) bool {
+	// Fast path: if the slice has fewer elements than the set, they can't be equal.
+	if len(slice) < len(set) {
+		return false
+	}
 	// Check slice⊆set and count unique slice elements in one pass.
 	seen := make(map[string]struct{}, len(slice))
 	for _, s := range slice {
@@ -1715,9 +1719,9 @@ func (i *Ingester) pushSamplesToAppender(
 		if ts.ScopeAttributes != nil {
 			if ts.ScopeAttributes.Name != "" || ts.ScopeAttributes.Version != "" || ts.ScopeAttributes.SchemaURL != "" || len(ts.ScopeAttributes.Attrs) > 0 {
 				scopeCtx = &storage.ScopeContext{
-					Name:      ts.ScopeAttributes.Name,
-					Version:   ts.ScopeAttributes.Version,
-					SchemaURL: ts.ScopeAttributes.SchemaURL,
+					Name:      strings.Clone(ts.ScopeAttributes.Name),
+					Version:   strings.Clone(ts.ScopeAttributes.Version),
+					SchemaURL: strings.Clone(ts.ScopeAttributes.SchemaURL),
 					Attrs:     entriesToMap(ts.ScopeAttributes.Attrs),
 				}
 			}
@@ -2035,19 +2039,24 @@ func (i *Ingester) handleExemplarPartialErrors(
 	}
 }
 
-// entriesToMap converts a slice of AttributeEntry to a map.
+// entriesToMap converts a slice of AttributeEntry to a map, cloning all strings
+// to ensure safety. The input entries may contain UnsafeMutableStrings backed
+// by a gRPC buffer that is returned to the pool after the request is processed
+// (see CLAUDE.md "Unsafe memory tricks").
 func entriesToMap(entries []mimirpb.AttributeEntry) map[string]string {
 	if len(entries) == 0 {
 		return nil
 	}
 	m := make(map[string]string, len(entries))
 	for _, e := range entries {
-		m[e.Key] = e.Value
+		m[strings.Clone(e.Key)] = strings.Clone(e.Value)
 	}
 	return m
 }
 
 // convertResourceEntities converts ResourceEntity slice to storage.EntityData slice.
+// All strings are deep-copied via entriesToMap (which clones) to avoid retaining
+// references to the gRPC buffer pool.
 func convertResourceEntities(entities []mimirpb.ResourceEntity) []storage.EntityData {
 	if len(entities) == 0 {
 		return nil
@@ -2055,7 +2064,7 @@ func convertResourceEntities(entities []mimirpb.ResourceEntity) []storage.Entity
 	result := make([]storage.EntityData, len(entities))
 	for i, e := range entities {
 		result[i] = storage.EntityData{
-			Type:        e.Type,
+			Type:        strings.Clone(e.Type),
 			ID:          entriesToMap(e.ID),
 			Description: entriesToMap(e.Description),
 		}

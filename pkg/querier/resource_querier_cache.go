@@ -4,10 +4,13 @@ package querier
 
 import (
 	"context"
+	"sort"
 	"sync"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/user"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
@@ -46,34 +49,43 @@ type resourceQuerierCache struct {
 	// Logger for debugging
 	logger log.Logger
 
-	// Stored context from Select() for use in GetResourceAt()
-	// This is needed because the ResourceQuerier interface doesn't pass context
-	storedCtx   context.Context
-	storedCtxMu sync.Mutex
+	// Provider for per-tenant cache size limit (bytes). May be nil.
+	maxCacheBytesProvider func(userID string) int
+
+	// Tenant ID captured from Select()/LabelValues()/LabelNames() for use in
+	// GetResourceAt(). We store only the tenant ID (not the full context) because
+	// the span-derived context from Select() may be cancelled by the time the
+	// PromQL engine calls GetResourceAt() during sample iteration.
+	tenantID   string
+	tenantIDMu sync.Mutex
 
 	// Cache state
 	cache            map[uint64]*seriesmetadata.VersionedResource
 	uniqueAttrNames  map[string]struct{}
 	cacheInitMu      sync.Mutex
 	cacheInitialized bool
+	cacheInitErr     error // memoized error from first failed init attempt
 }
 
 // NewResourceQuerierCache creates a new resourceQuerierCache wrapping the given querier.
+// maxCacheBytesProvider, if non-nil, limits the total estimated memory of the cache.
 func NewResourceQuerierCache(
 	querier storage.Querier,
 	fetcher ResourceAttributesFetcher,
 	minT, maxT int64,
+	maxCacheBytesProvider func(userID string) int,
 	logger log.Logger,
 ) storage.Querier {
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
 	return &resourceQuerierCache{
-		Querier: querier,
-		fetcher: fetcher,
-		minT:    minT,
-		maxT:    maxT,
-		logger:  logger,
+		Querier:               querier,
+		fetcher:               fetcher,
+		minT:                  minT,
+		maxT:                  maxT,
+		maxCacheBytesProvider: maxCacheBytesProvider,
+		logger:                logger,
 	}
 }
 
@@ -84,14 +96,21 @@ func (q *resourceQuerierCache) GetResourceAt(labelsHash uint64, timestamp int64)
 		return nil, false
 	}
 
-	// Use stored context from Select() call, fall back to Background if not available
-	q.storedCtxMu.Lock()
-	ctx := q.storedCtx
-	q.storedCtxMu.Unlock()
-	if ctx == nil {
-		level.Debug(q.logger).Log("msg", "GetResourceAt: no stored context available")
-		ctx = context.Background()
+	q.tenantIDMu.Lock()
+	tid := q.tenantID
+	q.tenantIDMu.Unlock()
+	if tid == "" {
+		// No tenant ID means Select/LabelValues/LabelNames was never called.
+		level.Warn(q.logger).Log("msg", "GetResourceAt: no stored tenant ID available, skipping resource attributes")
+		return nil, false
 	}
+
+	// Build a fresh context with just the tenant ID and a timeout. We cannot
+	// use the context from Select() because its span may already be finished.
+	// The timeout prevents indefinite blocking if the store-gateway RPC hangs.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	ctx = user.InjectOrgID(ctx, tid)
 
 	if err := q.ensureCacheInitialized(ctx); err != nil {
 		// Log warning but don't fail the query - graceful degradation
@@ -115,16 +134,22 @@ func (q *resourceQuerierCache) IterUniqueAttributeNames(fn func(name string)) er
 		return nil
 	}
 
-	// Use stored context from Select() call, fall back to Background if not available
-	q.storedCtxMu.Lock()
-	ctx := q.storedCtx
-	q.storedCtxMu.Unlock()
-	if ctx == nil {
-		ctx = context.Background()
+	q.tenantIDMu.Lock()
+	tid := q.tenantID
+	q.tenantIDMu.Unlock()
+	if tid == "" {
+		level.Warn(q.logger).Log("msg", "IterUniqueAttributeNames: no stored tenant ID available, skipping resource attributes")
+		return nil
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	ctx = user.InjectOrgID(ctx, tid)
+
 	if err := q.ensureCacheInitialized(ctx); err != nil {
-		return err
+		// Degrade gracefully, matching GetResourceAt's behavior.
+		level.Warn(q.logger).Log("msg", "failed to initialize resource cache", "err", err)
+		return nil
 	}
 
 	for name := range q.uniqueAttrNames {
@@ -134,6 +159,9 @@ func (q *resourceQuerierCache) IterUniqueAttributeNames(fn func(name string)) er
 }
 
 // ensureCacheInitialized pre-fetches resource attributes on first call (lazy loading).
+// On failure, the error is memoized to avoid retrying the RPC on every sample point.
+// This is safe because the error is scoped to this querier instance (one per query),
+// not shared globally; a new query gets a fresh cache with no memoized error.
 func (q *resourceQuerierCache) ensureCacheInitialized(ctx context.Context) error {
 	q.cacheInitMu.Lock()
 	defer q.cacheInitMu.Unlock()
@@ -141,27 +169,67 @@ func (q *resourceQuerierCache) ensureCacheInitialized(ctx context.Context) error
 	if q.cacheInitialized {
 		return nil
 	}
+	if q.cacheInitErr != nil {
+		return q.cacheInitErr
+	}
 
 	if err := q.initializeCache(ctx); err != nil {
+		q.cacheInitErr = err
 		return err
 	}
 	q.cacheInitialized = true
 	return nil
 }
 
+// estimateResourceDataSize returns an approximate byte size for a ResourceAttributesData item.
+func estimateResourceDataSize(item *ResourceAttributesData) int64 {
+	size := int64(32) // LabelsHash + slice header
+	for _, v := range item.Versions {
+		size += 64 // struct overhead + time fields
+		for k, val := range v.Identifying {
+			size += int64(len(k) + len(val) + 16)
+		}
+		for k, val := range v.Descriptive {
+			size += int64(len(k) + len(val) + 16)
+		}
+	}
+	return size
+}
+
 // initializeCache performs the actual pre-fetch of resource attributes.
 func (q *resourceQuerierCache) initializeCache(ctx context.Context) error {
-	// Fetch all resource attributes for this time range
+	// Fetch all resource attributes for this time range.
 	data, err := q.fetcher.FetchResourceAttributes(ctx, q.minT, q.maxT)
 	if err != nil {
 		return err
+	}
+
+	// Determine max cache size from the provider (if set).
+	var maxBytes int64
+	if q.maxCacheBytesProvider != nil {
+		q.tenantIDMu.Lock()
+		tid := q.tenantID
+		q.tenantIDMu.Unlock()
+		if tid != "" {
+			maxBytes = int64(q.maxCacheBytesProvider(tid))
+		}
 	}
 
 	// Populate cache
 	q.cache = make(map[uint64]*seriesmetadata.VersionedResource, len(data))
 	q.uniqueAttrNames = make(map[string]struct{})
 
+	var totalBytes int64
 	for _, item := range data {
+		if maxBytes > 0 {
+			totalBytes += estimateResourceDataSize(item)
+			if totalBytes > maxBytes {
+				level.Warn(q.logger).Log("msg", "resource cache size limit reached, truncating",
+					"limit_bytes", maxBytes, "cached_series", len(q.cache), "total_series", len(data))
+				break
+			}
+		}
+
 		// Merge versions if the same series appears from multiple sources
 		// (e.g., different store-gateways serving different blocks).
 		if existing, ok := q.cache[item.LabelsHash]; ok {
@@ -192,40 +260,31 @@ func (q *resourceQuerierCache) initializeCache(ctx context.Context) error {
 	return nil
 }
 
-// Select implements storage.Querier and captures the context for later use in GetResourceAt.
+// Select implements storage.Querier and captures the tenant ID for later use in GetResourceAt.
 func (q *resourceQuerierCache) Select(ctx context.Context, sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
-	// Store the context for later use in GetResourceAt
-	q.storedCtxMu.Lock()
-	if q.storedCtx == nil {
-		q.storedCtx = ctx
-	}
-	q.storedCtxMu.Unlock()
-
+	q.storeTenantID(ctx)
 	return q.Querier.Select(ctx, sortSeries, hints, matchers...)
 }
 
-// LabelValues implements storage.Querier and captures the context for later use.
+// LabelValues implements storage.Querier and captures the tenant ID for later use.
 func (q *resourceQuerierCache) LabelValues(ctx context.Context, name string, hints *storage.LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
-	// Store the context for later use in GetResourceAt
-	q.storedCtxMu.Lock()
-	if q.storedCtx == nil {
-		q.storedCtx = ctx
-	}
-	q.storedCtxMu.Unlock()
-
+	q.storeTenantID(ctx)
 	return q.Querier.LabelValues(ctx, name, hints, matchers...)
 }
 
-// LabelNames implements storage.Querier and captures the context for later use.
+// LabelNames implements storage.Querier and captures the tenant ID for later use.
 func (q *resourceQuerierCache) LabelNames(ctx context.Context, hints *storage.LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
-	// Store the context for later use in GetResourceAt
-	q.storedCtxMu.Lock()
-	if q.storedCtx == nil {
-		q.storedCtx = ctx
-	}
-	q.storedCtxMu.Unlock()
-
+	q.storeTenantID(ctx)
 	return q.Querier.LabelNames(ctx, hints, matchers...)
+}
+
+// storeTenantID extracts and stores the tenant ID from the given context.
+func (q *resourceQuerierCache) storeTenantID(ctx context.Context) {
+	if tid, err := user.ExtractOrgID(ctx); err == nil {
+		q.tenantIDMu.Lock()
+		q.tenantID = tid
+		q.tenantIDMu.Unlock()
+	}
 }
 
 // Close releases resources.
@@ -240,7 +299,7 @@ type distributorResourceFetcher struct {
 
 // FetchResourceAttributes fetches resource attributes from ingesters via the distributor.
 func (f *distributorResourceFetcher) FetchResourceAttributes(ctx context.Context, minT, maxT int64) ([]*ResourceAttributesData, error) {
-	// Use a matcher that matches all series (required for getPostings to return results)
+	// Use a matcher that matches all series (required for getPostings to return results).
 	allSeriesMatcher, _ := labels.NewMatcher(labels.MatchNotEqual, model.MetricNameLabel, "")
 	results, err := f.distributor.ResourceAttributes(ctx, minT, maxT, []*labels.Matcher{allSeriesMatcher}, 0, nil)
 	if err != nil {
@@ -266,7 +325,7 @@ type blocksResourceFetcher struct {
 
 // FetchResourceAttributes fetches resource attributes from store-gateways.
 func (f *blocksResourceFetcher) FetchResourceAttributes(ctx context.Context, minT, maxT int64) ([]*ResourceAttributesData, error) {
-	// Use a matcher that matches all series (required for getPostings to return results)
+	// Use a matcher that matches all series (required for getPostings to return results).
 	allSeriesMatcher, _ := labels.NewMatcher(labels.MatchNotEqual, model.MetricNameLabel, "")
 	results, err := f.blocksQueryable.ResourceAttributes(ctx, minT, maxT, []*labels.Matcher{allSeriesMatcher}, 0, nil)
 	if err != nil {
@@ -319,7 +378,9 @@ func convertIngesterVersions(versions []*ingester_client.ResourceVersionData) []
 	return result
 }
 
-// mergeCacheVersions merges two slices of resource versions, deduplicating by time range.
+// mergeCacheVersions merges two slices of resource versions, deduplicating by
+// time range AND identifying attributes. Two versions with the same time range
+// but different identifying attributes are distinct and must not be collapsed.
 func mergeCacheVersions(a, b []*seriesmetadata.ResourceVersion) []*seriesmetadata.ResourceVersion {
 	if len(a) == 0 {
 		return b
@@ -329,15 +390,16 @@ func mergeCacheVersions(a, b []*seriesmetadata.ResourceVersion) []*seriesmetadat
 	}
 
 	type versionKey struct {
-		minTime int64
-		maxTime int64
+		minTime     int64
+		maxTime     int64
+		identifying string
 	}
 
 	seen := make(map[versionKey]bool, len(a))
 	result := make([]*seriesmetadata.ResourceVersion, 0, len(a)+len(b))
 
 	for _, v := range a {
-		key := versionKey{v.MinTime, v.MaxTime}
+		key := versionKey{v.MinTime, v.MaxTime, labelsMapToKey(v.Identifying)}
 		if !seen[key] {
 			seen[key] = true
 			result = append(result, v)
@@ -345,12 +407,16 @@ func mergeCacheVersions(a, b []*seriesmetadata.ResourceVersion) []*seriesmetadat
 	}
 
 	for _, v := range b {
-		key := versionKey{v.MinTime, v.MaxTime}
+		key := versionKey{v.MinTime, v.MaxTime, labelsMapToKey(v.Identifying)}
 		if !seen[key] {
 			seen[key] = true
 			result = append(result, v)
 		}
 	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].MinTime < result[j].MinTime
+	})
 
 	return result
 }

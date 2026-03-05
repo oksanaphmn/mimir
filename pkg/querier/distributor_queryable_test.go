@@ -896,3 +896,7 @@ func (p *mockConfigProvider) QueryIngestersWithin(userID string) time.Duration {
 	p.seenUserIDs = append(p.seenUserIDs, userID)
 	return p.queryIngestersWithin
 }
+
+func (p *mockConfigProvider) MaxResourceAttributesCacheSizeBytes(_ string) int {
+	return 0
+}

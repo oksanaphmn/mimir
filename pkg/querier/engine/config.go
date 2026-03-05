@@ -4,6 +4,7 @@ package engine
 
 import (
 	"flag"
+	"fmt"
 	"strings"
 	"time"
 
@@ -62,6 +63,11 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 }
 
 func (cfg *Config) Validate() error {
+	switch cfg.InfoResourceStrategy {
+	case "target-info", "resource-attributes", "hybrid", "":
+	default:
+		return fmt.Errorf("invalid -querier.info-resource-strategy %q: must be one of target-info, resource-attributes, hybrid", cfg.InfoResourceStrategy)
+	}
 	return cfg.MimirQueryEngine.Validate()
 }
 

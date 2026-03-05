@@ -59,6 +59,8 @@ const (
 	MaxSeriesQueryLimitFlag                     = "querier.max-series-query-limit"
 	MaxLabelNamesLimitFlag                      = "querier.max-label-names-limit"
 	MaxLabelValuesLimitFlag                     = "querier.max-label-values-limit"
+	MaxResourceAttributesQueryLimitFlag         = "querier.max-resource-attributes-query-limit"
+	MaxResourceAttributesCacheSizeBytesFlag     = "querier.max-resource-attributes-cache-size-bytes"
 	MaxTotalQueryLengthFlag                     = "query-frontend.max-total-query-length"
 	MaxQueryExpressionSizeBytesFlag             = "query-frontend.max-query-expression-size-bytes"
 	MaxActiveSeriesPerUserFlag                  = "distributor.max-active-series-per-user"
@@ -208,6 +210,8 @@ type Limits struct {
 	MaxSeriesQueryLimit                   int            `yaml:"max_series_query_limit" json:"max_series_query_limit"`
 	MaxLabelNamesLimit                    int            `yaml:"max_label_names_limit" json:"max_label_names_limit"`
 	MaxLabelValuesLimit                   int            `yaml:"max_label_values_limit" json:"max_label_values_limit"`
+	MaxResourceAttributesQueryLimit       int            `yaml:"max_resource_attributes_query_limit" json:"max_resource_attributes_query_limit"`
+	MaxResourceAttributesCacheSizeBytes   int            `yaml:"max_resource_attributes_cache_size_bytes" json:"max_resource_attributes_cache_size_bytes" category:"advanced"`
 	MaxCacheFreshness                     model.Duration `yaml:"max_cache_freshness" json:"max_cache_freshness" category:"advanced"`
 	MaxQueriersPerTenant                  int            `yaml:"max_queriers_per_tenant" json:"max_queriers_per_tenant"`
 	QueryShardingTotalShards              int            `yaml:"query_sharding_total_shards" json:"query_sharding_total_shards"`
@@ -422,6 +426,8 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&l.MaxSeriesQueryLimit, MaxSeriesQueryLimitFlag, 0, "Maximum number of series, the series endpoint queries. This limit is enforced in the querier. If the requested limit is outside of the allowed value, the request doesn't fail, but is manipulated to only query data up to the allowed limit. Set to 0 to disable.")
 	f.IntVar(&l.MaxLabelNamesLimit, MaxLabelNamesLimitFlag, 0, "Maximum number of names the label names endpoint returns. This limit is enforced in the querier. If the requested limit is outside of the allowed value, the request doesn't fail, but is manipulated to only query data up to the allowed limit. Set to 0 to disable.")
 	f.IntVar(&l.MaxLabelValuesLimit, MaxLabelValuesLimitFlag, 0, "Maximum number of values the label values endpoint returns. This limit is enforced in the querier. If the requested limit is outside of the allowed value, the request doesn't fail, but is manipulated to only query data up to the allowed limit. Set to 0 to disable.")
+	f.IntVar(&l.MaxResourceAttributesQueryLimit, MaxResourceAttributesQueryLimitFlag, 10000, "Maximum number of series the resource attributes endpoints return. If the requested limit exceeds this value, it is clamped. 0 to disable.")
+	f.IntVar(&l.MaxResourceAttributesCacheSizeBytes, MaxResourceAttributesCacheSizeBytesFlag, 50*1024*1024, "Maximum estimated memory for the per-query resource attributes cache. 0 to disable.")
 
 	f.IntVar(&l.LabelNamesAndValuesResultsMaxSizeBytes, "querier.label-names-and-values-results-max-size-bytes", 400*1024*1024, "Maximum size in bytes of distinct label names and values. When querier receives response from ingester, it merges the response with responses from other ingesters. This maximum size limit is applied to the merged(distinct) results. If the limit is reached, an error is returned.")
 	f.IntVar(&l.ActiveSeriesResultsMaxSizeBytes, "querier.active-series-results-max-size-bytes", 400*1024*1024, "Maximum size of an active series or active native histogram series request result shard in bytes. 0 to disable.")
@@ -703,6 +709,10 @@ func (l *Limits) Validate() error {
 
 	if l.EarlyHeadCompactionMinEstimatedSeriesReductionPercentage < 0 || l.EarlyHeadCompactionMinEstimatedSeriesReductionPercentage > 100 {
 		return fmt.Errorf("early_head_compaction_min_estimated_series_reduction_percentage must be between 0 and 100")
+	}
+
+	if l.OTelResourceAttrIndexEnabled && !l.OTelPersistResourceAttributes {
+		return fmt.Errorf("otel_resource_attr_index_enabled requires otel_persist_resource_attributes to be enabled")
 	}
 
 	// Validate additional custom tracker config doesn't exceed the limit.
@@ -1013,6 +1023,16 @@ func (o *Overrides) MaxLabelNamesLimit(userID string) int {
 // MaxLabelValuesLimit returns the query limit of a label values request.
 func (o *Overrides) MaxLabelValuesLimit(userID string) int {
 	return o.getOverridesForUser(userID).MaxLabelValuesLimit
+}
+
+// MaxResourceAttributesQueryLimit returns the maximum number of series the resource attributes endpoints return.
+func (o *Overrides) MaxResourceAttributesQueryLimit(userID string) int {
+	return o.getOverridesForUser(userID).MaxResourceAttributesQueryLimit
+}
+
+// MaxResourceAttributesCacheSizeBytes returns the maximum estimated memory for the per-query resource attributes cache.
+func (o *Overrides) MaxResourceAttributesCacheSizeBytes(userID string) int {
+	return o.getOverridesForUser(userID).MaxResourceAttributesCacheSizeBytes
 }
 
 // MaxCacheFreshness returns the period after which results are cacheable,

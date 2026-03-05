@@ -224,6 +224,9 @@ func (c *combinedAppender) AppendExemplar(ref storage.SeriesRef, l labels.Labels
 	return c.v1.AppendExemplar(ref, l, e)
 }
 
+// Commit commits AppenderV2 first (samples + resource attributes) then v1 (exemplars only).
+// AppenderV2 is committed first because it handles the primary data path. If AppenderV2
+// succeeds but v1 fails, we accept partial commit since v1 only handles exemplars.
 func (c *combinedAppender) Commit() error {
 	if err := c.AppenderV2.Commit(); err != nil {
 		return err

@@ -331,13 +331,19 @@ func NewQuerierHandler(
 	router.Path(path.Join(promPrefix, "/label/{name}/values")).Methods("GET").Handler(labelsQueryStats.Wrap(promRouter))
 	router.Path(path.Join(promPrefix, "/series")).Methods("GET", "POST", "DELETE").Handler(seriesQueryStats.Wrap(unlimitedMemoryTrackerMiddleware.Wrap(promRouter)))
 	router.Path(path.Join(promPrefix, "/metadata")).Methods("GET").Handler(metadataQueryStats.Wrap(querier.NewMetadataHandler(metadataSupplier)))
-	router.Path(path.Join(promPrefix, "/resources")).Methods("GET").Handler(querier.NewResourceAttributesHandler(distributor, blocksQueryable, querier.ResourceAttributesHandlerConfig{
-		QueryStoreAfter:      querierCfg.QueryStoreAfter,
-		QueryIngestersWithin: limits.QueryIngestersWithin,
+	router.Path(path.Join(promPrefix, "/resources")).Methods("GET", "POST").Handler(querier.NewResourceAttributesHandler(distributor, blocksQueryable, querier.ResourceAttributesHandlerConfig{
+		QueryStoreAfter:                 querierCfg.QueryStoreAfter,
+		QueryIngestersWithin:            limits.QueryIngestersWithin,
+		MaxQueryLookback:                limits.MaxQueryLookback,
+		MaxLabelsQueryLength:            limits.MaxLabelsQueryLength,
+		MaxResourceAttributesQueryLimit: limits.MaxResourceAttributesQueryLimit,
 	}))
-	router.Path(path.Join(promPrefix, "/resources/series")).Methods("GET").Handler(querier.NewResourceAttributesSeriesHandler(distributor, blocksQueryable, querier.ResourceAttributesHandlerConfig{
-		QueryStoreAfter:      querierCfg.QueryStoreAfter,
-		QueryIngestersWithin: limits.QueryIngestersWithin,
+	router.Path(path.Join(promPrefix, "/resources/series")).Methods("GET", "POST").Handler(querier.NewResourceAttributesSeriesHandler(distributor, blocksQueryable, querier.ResourceAttributesHandlerConfig{
+		QueryStoreAfter:                 querierCfg.QueryStoreAfter,
+		QueryIngestersWithin:            limits.QueryIngestersWithin,
+		MaxQueryLookback:                limits.MaxQueryLookback,
+		MaxLabelsQueryLength:            limits.MaxLabelsQueryLength,
+		MaxResourceAttributesQueryLimit: limits.MaxResourceAttributesQueryLimit,
 	}))
 	router.Path(path.Join(promPrefix, "/cardinality/label_names")).Methods("GET", "POST").Handler(cardinalityQueryStats.Wrap(querier.LabelNamesCardinalityHandler(distributor, limits)))
 	router.Path(path.Join(promPrefix, "/cardinality/label_values")).Methods("GET", "POST").Handler(cardinalityQueryStats.Wrap(querier.LabelValuesCardinalityHandler(distributor, limits)))

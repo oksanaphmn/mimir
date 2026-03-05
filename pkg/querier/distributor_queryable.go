@@ -58,6 +58,7 @@ func NewDistributorQueryable(distributor Distributor, cfgProvider distributorQue
 
 type distributorQueryableConfigProvider interface {
 	QueryIngestersWithin(userID string) time.Duration
+	MaxResourceAttributesCacheSizeBytes(userID string) int
 }
 
 type distributorQueryable struct {
@@ -83,6 +84,7 @@ func (d distributorQueryable) Querier(mint, maxt int64) (storage.Querier, error)
 		&distributorResourceFetcher{distributor: d.distributor},
 		mint,
 		maxt,
+		d.cfgProvider.MaxResourceAttributesCacheSizeBytes,
 		d.logger,
 	), nil
 }

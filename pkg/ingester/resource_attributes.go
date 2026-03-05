@@ -62,7 +62,7 @@ func (i *Ingester) ResourceAttributes(request *client.ResourceAttributesRequest,
 // resourceAttributesByFilter performs a reverse lookup using the inverted index.
 // It finds series that have specific resource attribute key:value pairs.
 func (i *Ingester) resourceAttributesByFilter(
-	_ context.Context,
+	ctx context.Context,
 	request *client.ResourceAttributesRequest,
 	stream client.Ingester_ResourceAttributesServer,
 	metaReader seriesmetadata.Reader,
@@ -74,7 +74,8 @@ func (i *Ingester) resourceAttributesByFilter(
 	for idx, filter := range filters {
 		hashes := metaReader.LookupResourceAttr(filter.GetKey(), filter.GetValue())
 		if idx == 0 {
-			matchingHashes = hashes
+			// Clone so we don't alias the metaReader's internal slice.
+			matchingHashes = append([]uint64(nil), hashes...)
 		} else {
 			matchingHashes = intersectSortedUint64(matchingHashes, hashes)
 		}
@@ -92,6 +93,9 @@ func (i *Ingester) resourceAttributesByFilter(
 	count := int64(0)
 
 	for _, labelsHash := range matchingHashes {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if limit > 0 && count >= limit {
 			break
 		}
@@ -172,6 +176,9 @@ func (i *Ingester) resourceAttributesByMatchers(
 	count := int64(0)
 
 	for postings.Next() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if limit > 0 && count >= limit {
 			break
 		}
