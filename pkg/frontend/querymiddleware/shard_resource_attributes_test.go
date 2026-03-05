@@ -9,12 +9,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/go-kit/log"
 	"github.com/grafana/dskit/user"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/atomic"
 
 	"github.com/grafana/mimir/pkg/util/promqlext"
 )
@@ -214,9 +216,9 @@ func Test_shardResourceAttributesMiddleware_RoundTrip(t *testing.T) {
 				maxShardedQueries: tc.maxShardCount,
 			}
 
-			var upstreamCallCount int
+			var upstreamCallCount atomic.Int32
 			upstream := RoundTripFunc(func(req *http.Request) (*http.Response, error) {
-				upstreamCallCount++
+				upstreamCallCount.Add(1)
 				if tc.upstreamFunc != nil {
 					return tc.upstreamFunc(req)
 				}
@@ -241,12 +243,12 @@ func Test_shardResourceAttributesMiddleware_RoundTrip(t *testing.T) {
 			require.NotNil(t, resp)
 
 			if tc.expectPassThru {
-				assert.Equal(t, 1, upstreamCallCount, "expected single upstream call for pass-through")
+				require.Equal(t, 1, int(upstreamCallCount.Load()), "expected single upstream call for pass-through")
 				return
 			}
 
 			// Verify sharded requests were made.
-			assert.Equal(t, tc.shardCount, upstreamCallCount, "expected %d sharded requests", tc.shardCount)
+			require.Equal(t, tc.shardCount, int(upstreamCallCount.Load()), "expected %d sharded requests", tc.shardCount)
 
 			// Parse response and check series count.
 			body, err := io.ReadAll(resp.Body)
@@ -286,9 +288,14 @@ func Test_shardResourceAttributesMiddleware_MultipleMatchEntries(t *testing.T) {
 	ctx := user.InjectOrgID(req.Context(), tenantID)
 	req = req.WithContext(ctx)
 
-	var requests []*http.Request
+	var (
+		requestsMu sync.Mutex
+		requests   []*http.Request
+	)
 	upstream := RoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requestsMu.Lock()
 		requests = append(requests, r)
+		requestsMu.Unlock()
 		return newJSONResponse(`{"status":"success","data":{"series":[]}}`), nil
 	})
 
